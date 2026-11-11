@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>Test</title>
+</head>
+<body>
+
+<div id="root"></div>
+<div id="special-characters-test"></div>
+
+<script>
+	window.onload = function() {
+		document.getElementById('root').innerText = 'Hello world from JS!';
+		/**
+		 * TODO: Original innerText "저는 7년 동안 한국에서 살았어요. Слава Україні!" was changed due to issues
+		 * with cheerio and website-scraper itself.
+		 * See https://github.com/cheeriojs/cheerio/pull/2280
+		 */
+		document.getElementById('special-characters-test').innerText = '7년 동안 한국에서 살았어요. Слава Україні!';
+	};
+</script>
+
+</body>
+</html>

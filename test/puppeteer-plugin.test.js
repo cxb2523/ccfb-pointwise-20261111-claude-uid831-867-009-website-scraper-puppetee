@@ -1,13 +1,19 @@
 import { expect } from 'chai';
 import http from 'http';
+import path from 'path';
+import { pathToFileURL } from 'url';
 import finalhandler from 'finalhandler';
 import serveStatic from 'serve-static';
 import fs from 'fs-extra';
 import scrape from 'website-scraper';
+import puppeteer, { TimeoutError } from '@website-scraper/puppeteer-version-wrapper';
 import PuppeteerPlugin from '../lib/index.js';
+import { createRequestInterceptor } from '../lib/requestRenderLock.js';
 
 const directory = './test/tmp';
 const SERVE_WEBSITE_PORT = 4567;
+const SLOW_WEBSITE_PORT = 4570;
+const blockedResourcesUrl = pathToFileURL(path.resolve('./test/mock/blocked-resources.html')).href;
 
 describe('Puppeteer plugin test', () => {
 	let result, content, server;
@@ -187,6 +193,241 @@ describe('Puppeteer plugin test', () => {
 			expect(cjkContent).to.contain('<div id="cjk-characters-test">磁致伸缩位移传感器 影响大跨度桥梁施工控制的因素</div>');
 		});
 	});
+
+	describe('Plugin option validation', () => {
+		it('should reject "document" in blockResourceTypes', () => {
+			expect(() => new PuppeteerPlugin({ blockResourceTypes: ['image', 'document'] }))
+				.to.throw(/document/);
+		});
+
+		it('should reject unknown resource type names', () => {
+			expect(() => new PuppeteerPlugin({ blockResourceTypes: ['flac'] }))
+				.to.throw(/unknown resource type/);
+		});
+
+		it('should reject a non-array blockResourceTypes', () => {
+			expect(() => new PuppeteerPlugin({ blockResourceTypes: 'image' }))
+				.to.throw(TypeError);
+		});
+
+		it('should reject illegal waitUntil values, also inside gotoOptions', () => {
+			expect(() => new PuppeteerPlugin({ waitUntil: 'forever' }))
+				.to.throw(/invalid waitUntil/);
+			expect(() => new PuppeteerPlugin({ gotoOptions: { waitUntil: 'nope' } }))
+				.to.throw(/invalid waitUntil/);
+		});
+
+		it('should accept an array of legal waitUntil values', () => {
+			const plugin = new PuppeteerPlugin({ waitUntil: ['domcontentloaded', 'networkidle2'] });
+			expect(plugin.gotoOptions.waitUntil).to.eql(['domcontentloaded', 'networkidle2']);
+		});
+
+		it('should pass timeout 0 through as "no timeout"', () => {
+			const plugin = new PuppeteerPlugin({ timeout: 0 });
+			expect(plugin.gotoOptions.timeout).to.eql(0);
+		});
+
+		it('should reject negative and non-numeric timeouts', () => {
+			expect(() => new PuppeteerPlugin({ timeout: -1 })).to.throw(TypeError);
+			expect(() => new PuppeteerPlugin({ timeout: '100' })).to.throw(TypeError);
+		});
+
+		it('should keep gotoOptions untouched when the new options are omitted', () => {
+			const plugin = new PuppeteerPlugin({ gotoOptions: { waitUntil: 'networkidle0' } });
+			expect(plugin.gotoOptions).to.eql({ waitUntil: 'networkidle0' });
+			expect(plugin.blockResourceTypes).to.eql([]);
+		});
+	});
+
+	describe('Request interceptor', () => {
+		function fakeRequest (type) {
+			return {
+				type,
+				aborted: false,
+				continued: false,
+				resourceType () {
+					return this.type;
+				},
+				url () {
+					return `http://example.com/${this.type}`;
+				},
+				abort () {
+					this.aborted = true;
+					return Promise.resolve();
+				},
+				continue () {
+					this.continued = true;
+					return Promise.resolve();
+				}
+			};
+		}
+
+		it('should abort blocked types and continue every other request, documents included', () => {
+			const interceptor = createRequestInterceptor(['image', 'font']);
+			const documentRequest = fakeRequest('document');
+			const imageRequest = fakeRequest('image');
+			const fontRequest = fakeRequest('font');
+			const scriptRequest = fakeRequest('script');
+
+			interceptor.onRequest(documentRequest);
+			interceptor.onRequest(imageRequest);
+			interceptor.onRequest(fontRequest);
+			interceptor.onRequest(scriptRequest);
+
+			expect(documentRequest.continued).to.eql(true);
+			expect(scriptRequest.continued).to.eql(true);
+			expect(imageRequest.aborted).to.eql(true);
+			expect(fontRequest.aborted).to.eql(true);
+			expect(interceptor.aborted).to.eql(2);
+			expect(interceptor.continued).to.eql(2);
+			expect(interceptor.pending).to.eql(4);
+		});
+
+		it('should never abort a document even when it is listed', () => {
+			const interceptor = createRequestInterceptor(['document']);
+			const request = fakeRequest('document');
+
+			interceptor.onRequest(request);
+
+			expect(request.continued).to.eql(true);
+			expect(request.aborted).to.eql(false);
+		});
+
+		it('should release the pending counter on requestfailed as well as requestfinished', () => {
+			const interceptor = createRequestInterceptor(['image']);
+
+			interceptor.onRequest(fakeRequest('image'));
+			expect(interceptor.pending).to.eql(1);
+			interceptor.onRequestFailed();
+			expect(interceptor.pending).to.eql(0);
+
+			interceptor.onRequest(fakeRequest('script'));
+			interceptor.onRequestFinished();
+			expect(interceptor.pending).to.eql(0);
+		});
+
+		it('should assert while an intercepted request did not finish', () => {
+			const interceptor = createRequestInterceptor(['image']);
+			interceptor.onRequest(fakeRequest('image'));
+
+			expect(() => interceptor.assertDrained()).to.throw(/did not finish/);
+
+			interceptor.onRequestFailed();
+			interceptor.assertDrained();
+		});
+
+		it('should reconcile requests which got no terminal event on teardown', () => {
+			const interceptor = createRequestInterceptor([]);
+			interceptor.onRequest(fakeRequest('other'));
+			interceptor.onRequest(fakeRequest('document'));
+			interceptor.onRequestFinished();
+
+			expect(interceptor.pending).to.eql(1);
+			const abandoned = interceptor.drainAbandoned();
+
+			expect(abandoned).to.eql(1);
+			expect(interceptor.abandoned).to.eql(1);
+			interceptor.assertDrained();
+		});
+
+		it('should swallow a rejected abort/continue when the target is already gone', async () => {
+			const interceptor = createRequestInterceptor(['image']);
+			const abortedRequest = fakeRequest('image');
+			abortedRequest.abort = () => Promise.reject(new Error('target closed'));
+			const continuedRequest = fakeRequest('script');
+			continuedRequest.continue = () => Promise.reject(new Error('target closed'));
+
+			interceptor.onRequest(abortedRequest);
+			interceptor.onRequest(continuedRequest);
+			await new Promise(resolve => setTimeout(resolve, 0));
+
+			expect(interceptor.aborted).to.eql(1);
+			expect(interceptor.continued).to.eql(1);
+		});
+	});
+
+	describe('Resource type blocking', () => {
+		let browser;
+
+		before('launch browser', async () => {
+			browser = await puppeteer.launch();
+		});
+		after('close browser', () => browser.close());
+
+		it('should abort blocked resource types and continue all other requests', async () => {
+			const plugin = new PuppeteerPlugin({ blockResourceTypes: ['image', 'stylesheet'] });
+			plugin.browser = browser;
+
+			const { body } = await plugin.renderPage(blockedResourcesUrl);
+			const { interceptor } = plugin;
+
+			// every intercepted request got exactly one outcome
+			expect(interceptor.aborted + interceptor.continued).to.eql(interceptor.log.length);
+
+			const abortedTypes = interceptor.log
+				.filter(entry => entry.blocked)
+				.map(entry => entry.type)
+				.sort();
+			const continuedTypes = interceptor.log
+				.filter(entry => !entry.blocked)
+				.map(entry => entry.type)
+				.sort();
+			expect(abortedTypes).to.eql(['image', 'stylesheet']);
+			expect(continuedTypes).to.eql(['document', 'script']);
+
+			// aborts finish via requestfailed, so the pending counter must be drained
+			// by the failure listener rather than the teardown reconciliation
+			expect(interceptor.pending).to.eql(0);
+			expect(interceptor.abandoned).to.eql(0);
+
+			// the document still rendered and the non-blocked script still executed
+			expect(body).to.contain('resource blocking page');
+			expect(body).to.contain('script loaded');
+		});
+
+		// aborted requests fire requestfailed instead of requestfinished; without
+		// releasing the pending counter on failures, networkidle0 waits hang until
+		// the goto timeout
+		it('should settle a networkidle0 wait despite aborted requests', async () => {
+			const plugin = new PuppeteerPlugin({
+				blockResourceTypes: ['image', 'stylesheet'],
+				waitUntil: 'networkidle0'
+			});
+			plugin.browser = browser;
+
+			await plugin.renderPage(blockedResourcesUrl);
+			expect(plugin.interceptor.pending).to.eql(0);
+			expect(plugin.interceptor.abandoned).to.eql(0);
+		});
+	});
+
+	describe('goto timeout', () => {
+		let slowServer, browser;
+
+		before('start slow webserver', () => slowServer = startSlowDocumentWebserver(SLOW_WEBSITE_PORT));
+		after('stop slow webserver', () => slowServer.close());
+		before('launch browser', async () => {
+			browser = await puppeteer.launch();
+		});
+		after('close browser', () => browser.close());
+
+		it('should reject with a TimeoutError and release the pending request', async () => {
+			const plugin = new PuppeteerPlugin({ timeout: 100, waitUntil: 'load' });
+			plugin.browser = browser;
+
+			const error = await plugin.renderPage(`http://localhost:${SLOW_WEBSITE_PORT}/`)
+				.then(() => null, caughtError => caughtError);
+
+			expect(error).to.be.instanceOf(TimeoutError);
+			// the document request was continued, only the server response was slow
+			expect(plugin.interceptor.continued).to.eql(1);
+			// page.close() aborts the in-flight document and the requestfailed
+			// listener releases the counter, so nothing relies on the teardown
+			// reconciliation and no request is left pending
+			expect(plugin.interceptor.abandoned).to.eql(0);
+			expect(plugin.interceptor.pending).to.eql(0);
+		});
+	});
 });
 
 // Simulates a website which rotates the session cookie via an ajax call
@@ -305,4 +546,24 @@ function startWebserver(port = 3000) {
 	});
 
 	return server.listen(port)
+}
+
+// Accepts and continues the request immediately but holds the document
+// response, so a page.goto with a tiny timeout fails while the request
+// itself stays in flight until the page is closed.
+function startSlowDocumentWebserver (port) {
+	const heldResponses = [];
+	const server = http.createServer((req, res) => {
+		heldResponses.push(res);
+	});
+
+	server.on('close', () => {
+		for (const res of heldResponses) {
+			if (!res.writableEnded) {
+				res.destroy();
+			}
+		}
+	});
+
+	return server.listen(port);
 }

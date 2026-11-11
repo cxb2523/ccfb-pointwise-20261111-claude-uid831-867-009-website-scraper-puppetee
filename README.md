@@ -45,10 +45,13 @@ import PuppeteerPlugin from 'website-scraper-puppeteer';
 await scrape({
     urls: ['https://www.instagram.com/gopro/'],
     directory: '/path/to/save',
-    plugins: [ 
+    plugins: [
       new PuppeteerPlugin({
         launchOptions: { headless: true }, /* optional */
         gotoOptions: { waitUntil: "networkidle0" }, /* optional */
+        blockResourceTypes: ['image', 'font', 'media', 'stylesheet'], /* optional */
+        waitUntil: 'networkidle0', /* optional, same as gotoOptions.waitUntil */
+        timeout: 30000, /* optional, page.goto timeout in ms, 0 disables it */
         scrollToBottom: { timeout: 10000, viewportN: 10 }, /* optional */
         exclusiveRendering: true, /* optional */
       })
@@ -58,6 +61,9 @@ await scrape({
 Puppeteer plugin constructor accepts the following params:
 * `launchOptions` - *(optional)* - puppeteer launch options, can be found in [puppeteer docs](https://pptr.dev/api/puppeteer.launchoptions)
 * `gotoOptions` - *(optional)* - puppeteer page.goto options, can be found in [puppeteer docs](https://pptr.dev/api/puppeteer.gotooptions)
+* `blockResourceTypes` - *(optional, defaults to `[]`)* - resource types which are aborted instead of downloaded, so `page.goto` does not spend time on assets the scraper does not need. Any [puppeteer resource type](https://pptr.dev/api/puppeteer.httprequest.resourcetype) is allowed except `document` (blocking it would blank the navigation); unknown type names throw an error. Blocking is implemented with a single request interceptor, so each request is either aborted or continued exactly once.
+* `waitUntil` - *(optional)* - when to consider the navigation finished, one of `load`, `domcontentloaded`, `networkidle0`, `networkidle2` (or an array of them). Equivalent to `gotoOptions.waitUntil`; takes precedence if both are given.
+* `timeout` - *(optional)* - navigation timeout in milliseconds passed to `page.goto`; `0` disables the timeout. Equivalent to `gotoOptions.timeout`; takes precedence if both are given.
 * `scrollToBottom` - *(optional)* - in some cases, the page needs to be scrolled down to render its assets (lazyloading). Because some pages can be really endless, the scrolldown process can be interrupted before reaching the bottom when one or both of the limitations below are reached:
     * `timeout` - in milliseconds
     * `viewportN` - viewport height multiplier

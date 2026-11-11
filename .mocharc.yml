@@ -1,0 +1,3 @@
+# test/mock contains browser fixtures (html, css, js, images), not test specs
+ignore:
+  - 'test/mock/**'
